@@ -72,9 +72,9 @@ class COCOKeypointsDataset(Dataset):
 
 # Hyperparameters
 num_keypoints = 17
-batch_size = 32
+batch_size = 64
 learning_rate = 1e-3
-num_epochs = 5
+num_epochs = 200
 
 # Create model, dataset, and data loader
 model = PoseEstimationModel(num_keypoints)
@@ -86,7 +86,8 @@ criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 # Training loop
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(torch.cuda.is_available())
+device = torch.device("cuda")
 model.to(device)
 
 for epoch in range(num_epochs):
