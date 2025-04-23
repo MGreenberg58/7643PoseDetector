@@ -10,6 +10,8 @@ from pycocotools.coco import COCO
 from PIL import Image
 import matplotlib.pyplot as plt
 
+scaler = torch.amp.GradScaler('cuda')
+
 # Define COCO keypoint names and skeleton connections
 KEYPOINT_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
@@ -30,6 +32,7 @@ def generate_heatmaps(keypoints, visibility, height, width, sigma=2):
     for i, (x, y) in enumerate(keypoints):
         if visibility[i] == 0:
             continue
+
 
         x_int, y_int = int(x * width), int(y * height)
         if x_int >= width or y_int >= height:
@@ -136,7 +139,7 @@ class COCOKeypointsDataset(torch.utils.data.Dataset):
         visibility = (keypoints[:, 2] > 0).astype(np.float32)
 
         # return img, keypoints_xy, visibility, img_id
-        heatmaps = generate_heatmaps(keypoints_xy, visibility, height=64, width=64)  # adjust size
+        heatmaps = generate_heatmaps(keypoints_xy, visibility, height=128, width=128)  # adjust size
         return img, heatmaps, img_id
 
 
@@ -202,21 +205,25 @@ class StackedHourglassNet(nn.Module):
     def __init__(self, num_keypoints, num_stacks=2, num_blocks=1, num_feats=256):
         super(StackedHourglassNet, self).__init__()
         self.num_stacks = num_stacks
+
+        # Replace manual preprocess with pretrained ResNet-34
+        resnet = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
         self.preprocess = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            ResidualBlock(64, 128),
-            nn.MaxPool2d(2, 2),
-            ResidualBlock(128, 128),
-            ResidualBlock(128, num_feats)
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3  # outputs 256 channels
         )
 
         self.hourglasses = nn.ModuleList([
             HourglassModule(4, num_feats) for _ in range(num_stacks)
         ])
         self.features = nn.ModuleList([
-            ResidualBlock(num_feats, num_feats) for _ in range(num_stacks)
+            nn.Sequential(*[ResidualBlock(num_feats, num_feats) for _ in range(num_blocks)])
+            for _ in range(num_stacks)
         ])
         self.outs = nn.ModuleList([
             nn.Conv2d(num_feats, num_keypoints, kernel_size=1) for _ in range(num_stacks)
@@ -238,44 +245,10 @@ class StackedHourglassNet(nn.Module):
             outputs.append(out)
             if i < self.num_stacks - 1:
                 x = x + self.merge_preds[i](out) + self.merge_features[i](feature)
+
+        # return F.interpolate(outputs[-1], size=(64, 64), mode='bilinear', align_corners=False)
         return outputs[-1]  # Only return final heatmap output
 
-# Define the direct regression model
-class DirectRegressionModel(nn.Module):
-    def __init__(self, num_keypoints):
-        super(DirectRegressionModel, self).__init__()
-        
-        # ResNet-34 backbone
-        resnet = models.resnet34(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        
-        # Regression head
-        self.fc = nn.Linear(512, num_keypoints * 2)  # x,y for each keypoint
-        
-    def forward(self, x):
-        x = self.backbone(x)
-        x = x.view(x.size(0), -1)
-        coords = self.fc(x)
-        return coords.view(coords.size(0), -1, 2)  # Reshape to (batch_size, num_keypoints, 2)
-
-# Custom collate function to handle None samples
-# def collate_fn(batch):
-#     """Handle None samples in batch"""
-#     if len(batch) == 1 and batch[0] is None:
-#         return None
-    
-#     # Filter out None values
-#     batch = [item for item in batch if item is not None]
-#     if len(batch) == 0:
-#         return None
-    
-#     # Create a custom batch
-#     images = torch.stack([item[0] for item in batch])
-#     keypoints = torch.tensor(np.array([item[1] for item in batch]))
-#     visibility = torch.tensor(np.array([item[2] for item in batch]))
-#     img_ids = [item[3] for item in batch]
-    
-#     return images, keypoints, visibility, img_ids
 
 def collate_fn(batch):
     batch = [item for item in batch if item is not None]
@@ -347,18 +320,20 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             optimizer.zero_grad()
             
             # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            with torch.amp.autocast('cuda'):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
             
             # Backward pass and optimize
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item()
             processed_batches += 1
             
             # Print progress
-            if batch_idx % 10 == 0:
+            if batch_idx % 25 == 0:
                 print(f'Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}')
         
         if processed_batches > 0:
@@ -399,70 +374,66 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         # Save the best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), 'pose_model.pth')
+            torch.save(model.state_dict(), 'checkpoint_pose_model.pth')
     
     return model
 
 # Main training script
 def main():
-    # Set paths
-    coco_root = '.'  # Update with your COCO dataset path
-    train_anno = os.path.join(coco_root, 'annotations', 'person_keypoints_train2017.json')
-    val_anno = os.path.join(coco_root, 'annotations', 'person_keypoints_train2017.json')
+    coco_root = '.'
+    anno_file = os.path.join(coco_root, 'annotations', 'person_keypoints_train2017.json')
     
-    # Define transformations
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
-    # Create datasets
-    train_dataset = COCOKeypointsDataset(coco_root, train_anno, transform=transform, min_keypoints=5)
-    val_dataset = COCOKeypointsDataset(coco_root, val_anno, transform=transform, min_keypoints=5)
-    
+
+    # Load full dataset once
+    full_dataset = COCOKeypointsDataset(
+        coco_root=coco_root,
+        anno_file=anno_file,
+        transform=transform,
+        min_keypoints=5
+    )
+
+    # 90/10 split
+    n = len(full_dataset)
+    n_train = int(0.9 * n)
+    n_val = n - n_train
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42)  # for reproducibility
+    )
+
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Validation dataset size: {len(val_dataset)}")
-    
-    # Create data loaders
+
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=50, 
-        shuffle=False, 
-        num_workers=8,
-        collate_fn=collate_fn
+        train_dataset, batch_size=64, shuffle=True, num_workers=8, collate_fn=collate_fn, pin_memory=True, persistent_workers=True
     )
-    
+
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=25, 
-        shuffle=False, 
-        num_workers=4,
-        collate_fn=collate_fn 
+        val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True, persistent_workers=True
     )
-    
-    # Initialize model
-    model = StackedHourglassNet(num_keypoints=17)  # COCO has 17 keypoints
-    
-    # Define loss function and optimizer
+
+    model = StackedHourglassNet(num_keypoints=17)
+
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    
-    # Learning rate scheduler
+    pretrained_params = list(model.preprocess.parameters())
+    new_params = [p for n, p in model.named_parameters() if not n.startswith('preprocess.')]
+
+    optimizer = torch.optim.Adam([
+        {'params': pretrained_params, 'lr': 1e-4, 'weight_decay':1e-5},  
+        {'params': new_params, 'lr': 1e-2}          
+    ])
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
-    
-    # Train the model
+
     trained_model = train_model(
-        model, 
-        train_loader, 
-        val_loader, 
-        criterion, 
-        optimizer, 
-        scheduler,
-        num_epochs=50
+        model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=200
     )
-    
-    # Save the final model
+
     torch.save(trained_model.state_dict(), 'new.pth')
     print("Training completed. Model saved.")
 
