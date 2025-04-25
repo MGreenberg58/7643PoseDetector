@@ -12,11 +12,11 @@ import random
 # ---- Hyperparameters ----
 IMAGE_SIZE = 256
 HEATMAP_SIZE = 64
-SIGMA = 2
+SIGMA = 3
 NUM_KEYPOINTS = 17
 BATCH_SIZE = 32
-EPOCHS = 100
-LR = 1e-3
+EPOCHS = 40
+LR = 3e-4
 
 # ---- Heatmap Generator ----
 def generate_heatmaps(keypoints, visibility, height, width, heatmap_size=64, sigma=2):
@@ -175,9 +175,9 @@ if __name__ == "__main__":
     dataset = COCOKeypointsHeatmapDataset(
         root=".", ann_file="annotations/person_keypoints_train2017.json", transform=transform)
 
-    # 70/30 split
+    # 90/10 split
     n = len(dataset)
-    n_train = int(0.7 * n)
+    n_train = int(0.9 * n)
     n_val = n - n_train
     train_dataset, val_dataset = torch.utils.data.random_split(
         dataset,

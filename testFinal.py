@@ -41,7 +41,8 @@ def visualize_heatmaps(heatmaps, save_dir, image_id):
         plt.axis('off')
         plt.title(KEYPOINT_NAMES[k])
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"{image_id}_heatmap_{KEYPOINT_NAMES[k]}.png"))
+        if not os.path.exists(os.path.join(save_dir, f"{image_id}_heatmap_{KEYPOINT_NAMES[k]}.png")):
+            plt.savefig(os.path.join(save_dir, f"{image_id}_heatmap_{KEYPOINT_NAMES[k]}.png"))
         plt.close()
 
 def evaluate_topo_model(model_path, coco_root, anno_file, output_folder, num_samples=30, threshold=0.2):
@@ -309,21 +310,21 @@ def evaluate_model(model_path, coco_root, anno_file, output_folder, num_samples=
             pred_keypoints[:, 1] = coords[:, 1] * height
             pred_keypoints[:, 2] = 1.0  
 
-    for k in range(17):
-        
-        # Calculate PCK for this image
-        image_pck, keypoint_correct = calculate_pck(
-            pred_keypoints, gt_keypoints, width, height, threshold, return_per_keypoint=True
-        )
-        pck_scores.append(image_pck)
-        
-        # Update per-keypoint statistics
         for k in range(17):
-            if gt_keypoints[k, 2] > 0:  # If keypoint is visible
-                visible_per_keypoint[k] += 1
-                if keypoint_correct[k]:
-                    pck_per_keypoint[k] += 1
-        
+            
+            # Calculate PCK for this image
+            image_pck, keypoint_correct = calculate_pck(
+                pred_keypoints, gt_keypoints, width, height, threshold, return_per_keypoint=True
+            )
+            pck_scores.append(image_pck)
+            
+            # Update per-keypoint statistics
+            for k in range(17):
+                if gt_keypoints[k, 2] > 0:  # If keypoint is visible
+                    visible_per_keypoint[k] += 1
+                    if keypoint_correct[k]:
+                        pck_per_keypoint[k] += 1
+            
         # Visualize results
         visualize_keypoints(
             image, pred_keypoints, gt_keypoints, 
@@ -344,7 +345,7 @@ def evaluate_model(model_path, coco_root, anno_file, output_folder, num_samples=
             "keypoints": [round(x, 2) for x in flattened_kpts],  
             "score": 1.0  # Dummy score unless you have confidence
         })
-        
+            
         print(f"Processed image {i+1}/{num_samples}: PCK = {image_pck:.4f}")
     
     avg_pck = 0.0
@@ -399,7 +400,7 @@ def evaluate_model(model_path, coco_root, anno_file, output_folder, num_samples=
     return avg_pck, per_keypoint_pck
 
 if __name__ == '__main__':
-    model_path = 'hourglass_epoch4.pth'
+    model_path = 'best_hourglass_epoch12.pth'
     coco_root = '.'
     anno_file = 'annotations/person_keypoints_val2017.json'
     output_folder = 'evaluation_topo_results'
