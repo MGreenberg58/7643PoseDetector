@@ -635,28 +635,28 @@ def visualize_keypoints(image, pred_keypoints, gt_keypoints, save_path, pck_scor
     plt.close()
 
 if __name__ == "__main__":
-    model_path = "best_hourglass_pretrained_64.pth"
+    model_path = "new.pth"
     coco_root = "."  # Update with your COCO dataset path
     anno_file = "annotations/person_keypoints_val2017.json"
     output_folder = "evaluation_results"
     
-    # avg_pck, per_keypoint_pck = evaluate_model(
-    #     model_path=model_path,
-    #     coco_root=coco_root,
-    #     anno_file=anno_file,
-    #     output_folder=output_folder,
-    #     num_samples=100,
-    #     threshold=0.2  # PCK@0.2
-    # )
-
-    avg_pck, per_keypoint_pck = evaluate_model_heatmap(
+    avg_pck, per_keypoint_pck = evaluate_model(
         model_path=model_path,
         coco_root=coco_root,
         anno_file=anno_file,
         output_folder=output_folder,
         num_samples=100,
         threshold=0.2  # PCK@0.2
-    )    
+    )
+
+    # avg_pck, per_keypoint_pck = evaluate_model_heatmap(
+    #     model_path=model_path,
+    #     coco_root=coco_root,
+    #     anno_file=anno_file,
+    #     output_folder=output_folder,
+    #     num_samples=100,
+    #     threshold=0.2  # PCK@0.2
+    # )    
     
     # Plot per-keypoint PCK
     plt.figure(figsize=(12, 6))

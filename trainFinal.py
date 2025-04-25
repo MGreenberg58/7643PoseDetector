@@ -138,117 +138,39 @@ class COCOKeypointsDataset(torch.utils.data.Dataset):
         # # Create visibility mask (1 for visible, 0 for invisible)
         visibility = (keypoints[:, 2] > 0).astype(np.float32)
 
-        # return img, keypoints_xy, visibility, img_id
-        heatmaps = generate_heatmaps(keypoints_xy, visibility, height=128, width=128)  # adjust size
-        return img, heatmaps, img_id
+        return img, keypoints_xy, visibility, img_id
+        # heatmaps = generate_heatmaps(keypoints_xy, visibility, height=128, width=128)  # adjust size
+        # return img, heatmaps, img_id
 
+class KeypointCoordinateRegressor(nn.Module):
+    def __init__(self, num_keypoints=17):
+        super(KeypointCoordinateRegressor, self).__init__()
+        self.num_keypoints = num_keypoints
+        resnet = models.resnet34(pretrained=True)
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ResidualBlock, self).__init__()
-        mid_channels = out_channels // 2
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0)
+        # Remove the final FC layer
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # Output: (B, 512, 8, 8)
 
-        self.bn2 = nn.BatchNorm2d(mid_channels)
-        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1)
+        # Downsample to vector
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # Output: (B, 512, 1, 1)
+        self.flatten = nn.Flatten()
 
-        self.bn3 = nn.BatchNorm2d(mid_channels)
-        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0)
-
-        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1) if in_channels != out_channels else nn.Identity()
-
-    def forward(self, x):
-        skip = self.skip(x)
-        x = F.relu(self.bn1(x))
-        x = self.conv1(x)
-        x = F.relu(self.bn2(x))
-        x = self.conv2(x)
-        x = F.relu(self.bn3(x))
-        x = self.conv3(x)
-        return x + skip
-
-class HourglassModule(nn.Module):
-    def __init__(self, depth, num_features):
-        super(HourglassModule, self).__init__()
-        self.depth = depth
-        self.num_features = num_features
-        self._build_module(self.depth)
-
-    def _build_module(self, level):
-        setattr(self, f"res_{level}_1", ResidualBlock(self.num_features, self.num_features))
-        setattr(self, f"pool_{level}", nn.MaxPool2d(2, 2))
-        setattr(self, f"res_{level}_2", ResidualBlock(self.num_features, self.num_features))
-        if level > 1:
-            self._build_module(level - 1)
-        else:
-            self.res_center = ResidualBlock(self.num_features, self.num_features)
-        setattr(self, f"res_{level}_3", ResidualBlock(self.num_features, self.num_features))
-        setattr(self, f"upsample_{level}", nn.Upsample(scale_factor=2))
-
-    def _forward(self, level, x):
-        up1 = getattr(self, f"res_{level}_1")(x)
-        low1 = getattr(self, f"pool_{level}")(x)
-        low1 = getattr(self, f"res_{level}_2")(low1)
-        if level > 1:
-            low2 = self._forward(level - 1, low1)
-        else:
-            low2 = self.res_center(low1)
-        low3 = getattr(self, f"res_{level}_3")(low2)
-        up2 = getattr(self, f"upsample_{level}")(low3)
-        return up1 + up2
-
-    def forward(self, x):
-        return self._forward(self.depth, x)
-
-class StackedHourglassNet(nn.Module):
-    def __init__(self, num_keypoints, num_stacks=2, num_blocks=1, num_feats=256):
-        super(StackedHourglassNet, self).__init__()
-        self.num_stacks = num_stacks
-
-        # Replace manual preprocess with pretrained ResNet-34
-        resnet = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
-        self.preprocess = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool,
-            resnet.layer1,
-            resnet.layer2,
-            resnet.layer3  # outputs 256 channels
+        # Regression head
+        self.head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, num_keypoints * 2),
+            nn.Sigmoid()  # Ensure output in [0, 1] range
         )
 
-        self.hourglasses = nn.ModuleList([
-            HourglassModule(4, num_feats) for _ in range(num_stacks)
-        ])
-        self.features = nn.ModuleList([
-            nn.Sequential(*[ResidualBlock(num_feats, num_feats) for _ in range(num_blocks)])
-            for _ in range(num_stacks)
-        ])
-        self.outs = nn.ModuleList([
-            nn.Conv2d(num_feats, num_keypoints, kernel_size=1) for _ in range(num_stacks)
-        ])
-        self.merge_features = nn.ModuleList([
-            nn.Conv2d(num_feats, num_feats, kernel_size=1) for _ in range(num_stacks - 1)
-        ])
-        self.merge_preds = nn.ModuleList([
-            nn.Conv2d(num_keypoints, num_feats, kernel_size=1) for _ in range(num_stacks - 1)
-        ])
-
     def forward(self, x):
-        x = self.preprocess(x)
-        outputs = []
-        for i in range(self.num_stacks):
-            hg = self.hourglasses[i](x)
-            feature = self.features[i](hg)
-            out = self.outs[i](feature)
-            outputs.append(out)
-            if i < self.num_stacks - 1:
-                x = x + self.merge_preds[i](out) + self.merge_features[i](feature)
-
-        # return F.interpolate(outputs[-1], size=(64, 64), mode='bilinear', align_corners=False)
-        return outputs[-1]  # Only return final heatmap output
-
+        x = self.backbone(x)             # (B, 512, 8, 8)
+        x = self.global_pool(x)          # (B, 512, 1, 1)
+        x = self.flatten(x)              # (B, 512)
+        x = self.head(x)                 # (B, 34)
+        x = x.view(-1, self.num_keypoints, 2)  # (B, 17, 2)
+        return x
+    
 
 def collate_fn(batch):
     batch = [item for item in batch if item is not None]
@@ -256,10 +178,11 @@ def collate_fn(batch):
         return None
 
     images = torch.stack([item[0] for item in batch])
-    heatmaps = torch.stack([item[1] for item in batch])
-    img_ids = [item[2] for item in batch]
+    keypoints = torch.from_numpy(np.array([item[1] for item in batch], dtype=np.float32))
+    visibility = torch.from_numpy(np.array([item[2] for item in batch], dtype=np.float32))
+    img_ids = [item[3] for item in batch]
 
-    return images, heatmaps, img_ids
+    return images, keypoints, visibility, img_ids
 
 # Define the weighted MSE loss function
 class WeightedMSELoss(nn.Module):
@@ -311,10 +234,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             if batch is None:
                 continue
                 
-            inputs, targets, _ = batch
+            inputs, targets, visibility, _ = batch
             inputs = inputs.to(device)
             targets = targets.to(device)
-            # visibility = visibility.to(device)
+            visibility = visibility.to(device)
             
             # Zero the parameter gradients
             optimizer.zero_grad()
@@ -322,7 +245,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             # Forward pass
             with torch.amp.autocast('cuda'):
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets, visibility)
             
             # Backward pass and optimize
             scaler.scale(loss).backward()
@@ -350,16 +273,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         processed_val_batches = 0
         
         with torch.no_grad():
-            for inputs, targets, _ in val_loader:
+            for inputs, targets, visibility, _ in val_loader:
                 if inputs is None:
                     continue
                     
                 inputs = inputs.to(device)
                 targets = targets.to(device)
-                # visibility = visibility.to(device)
+                visibility = visibility.to(device)
                 
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets, visibility)
                 
                 val_loss += loss.item()
                 processed_val_batches += 1
@@ -399,7 +322,7 @@ def main():
 
     # 90/10 split
     n = len(full_dataset)
-    n_train = int(0.9 * n)
+    n_train = int(0. * n)
     n_val = n - n_train
     train_dataset, val_dataset = torch.utils.data.random_split(
         full_dataset,
@@ -418,20 +341,20 @@ def main():
         val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True, persistent_workers=True
     )
 
-    model = StackedHourglassNet(num_keypoints=17)
+    model = KeypointCoordinateRegressor(num_keypoints=17)
 
-    criterion = nn.MSELoss()
-    pretrained_params = list(model.preprocess.parameters())
-    new_params = [p for n, p in model.named_parameters() if not n.startswith('preprocess.')]
+    criterion = WeightedMSELoss()
+    pretrained_params = list(model.backbone.parameters())
+    new_params = [p for n, p in model.named_parameters() if not n.startswith('backbone.')]
 
     optimizer = torch.optim.Adam([
         {'params': pretrained_params, 'lr': 1e-4, 'weight_decay':1e-5},  
-        {'params': new_params, 'lr': 1e-2}          
+        {'params': new_params, 'lr': 1e-3}          
     ])
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.7)
 
     trained_model = train_model(
-        model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=200
+        model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=400
     )
 
     torch.save(trained_model.state_dict(), 'new.pth')
